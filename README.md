@@ -1,4 +1,5 @@
-![Weather GIF](https://github.com/user-attachments/assets/732b4c1a-459f-47fd-b632-7d1b4a6c60fe)
+![image](https://github.com/user-attachments/assets/c0602b0d-8d77-4f55-b044-78da2eedc645)
+
 WeatherAI Script
 
 This script handles the ingestion, preprocessing, and modeling of weather and space event data.
