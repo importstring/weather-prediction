@@ -38,7 +38,7 @@ from sklearn.metrics import mean_squared_error, r2_score, roc_curve, auc
 # ============================
 
 # Define the base directory paths
-BASE_DIR = "/Users/simon/Desktop/Areas/TKS/Focus1Rep2/WeatherAI"
+BASE_DIR = "YOUR BASe DIRECTORY"
 KNOWLEDGE_PATH = os.path.join(BASE_DIR, 'Databases', 'Knowledge')  # Central location for logs and models
 
 # Ensure the knowledge directory exists
