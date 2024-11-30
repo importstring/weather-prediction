@@ -5,9 +5,10 @@ WeatherAI Script
 This script handles the ingestion, preprocessing, and modeling of weather and space event data.
 It continuously monitors specified directories for new or modified CSV files, processes the data,
 trains a machine learning model, and makes predictions based on the updated data.
+It also includes functionalities for generating forecasts, evaluating model accuracy, and updating the model incrementally.
 
 Author: Simon
-Date: 2024-04-27
+Date: 2024-11-30
 """
 
 import re
@@ -38,7 +39,7 @@ from sklearn.metrics import mean_squared_error, r2_score, roc_curve, auc
 # ============================
 
 # Define the base directory paths
-BASE_DIR = "YOUR BASe DIRECTORY"
+BASE_DIR = "/Users/simon/Desktop/Areas/TKS/Focus1Rep2/WeatherAI"
 KNOWLEDGE_PATH = os.path.join(BASE_DIR, 'Databases', 'Knowledge')  # Central location for logs and models
 
 # Ensure the knowledge directory exists
