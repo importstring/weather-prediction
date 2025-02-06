@@ -8,31 +8,35 @@ trains a machine learning model, and makes predictions based on the updated data
 It also includes functionalities for generating forecasts, evaluating model accuracy, and updating the model incrementally.
 
 Author: Simon
-Date: 2024-11-30
+Date: 2024-12-14
 """
 
-import re
 import os
+import re
 import sys
 import time
 import json
-import joblib
-import numbers
 import logging
+import numbers
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+
+import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from utilities import update_data
-from datetime import datetime, timedelta
+from sklearn.exceptions import NotFittedError
+from sklearn.utils.validation import check_is_fitted
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
-from logging.handlers import RotatingFileHandler
-from watchdog.events import FileSystemEventHandler
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.linear_model import SGDRegressor, LinearRegression
-from sklearn.metrics import mean_squared_error, r2_score, roc_curve, auc
+from sklearn.metrics import mean_squared_error, r2_score, roc_auc_score, roc_curve, auc
+from watchdog.events import FileSystemEventHandler
+
+from utils import update_data, clear
 
 # ============================
 # Configuration and Setup
@@ -40,7 +44,7 @@ from sklearn.metrics import mean_squared_error, r2_score, roc_curve, auc
 
 # Define the base directory paths
 BASE_DIR = "/Users/simon/Desktop/Areas/TKS/Focus1Rep2/WeatherAI"
-KNOWLEDGE_PATH = os.path.join(BASE_DIR, 'Databases', 'Knowledge')  # Central location for logs and models
+KNOWLEDGE_PATH = os.path.join(BASE_DIR, 'Databases', 'QuickFix_Knowledge')  # Central location for logs and models
 
 # Ensure the knowledge directory exists
 try:
@@ -66,7 +70,7 @@ except Exception as e:
     sys.exit(1)
 
 # Define Paths
-REAL_TIME_DATA_PATH = os.path.join(BASE_DIR, 'Databases', 'Data', 'Hourly Data')
+REAL_TIME_DATA_PATH = os.path.join(BASE_DIR, 'Databases', 'Data', 'Weather')
 SPACE_DATA_PATH = os.path.join(BASE_DIR, 'Databases', 'Data', 'Space Data')
 NEAR_EARTH_SPACE_DATA_PATH = os.path.join(BASE_DIR, 'Databases', 'Data', 'Near Earth Space Data')
 
@@ -89,8 +93,9 @@ preprocessor = None
 
 # Define target variables
 POSSIBLE_TARGETS = {
-    'WIND_SPEED', 'VISIBILITY', 'STATION_PRESSURE', 'TEMP', 'RELATIVE_HUMIDITY', 
-    'WINDCHILL', 'HUMIDEX', 'PRECIP_AMOUNT', 'DEW_POINT_TEMP'
+    'visibility', 'dew_point_temp', 'feels_like', 'temp_min', 'temp_max', 
+    'pressure_average', 'humidity', 'wind_speed', 'wind_deg', 'wind_gust', 
+    'clouds_all', 'weather_id', 'weather_main', 'weather_description', 'weather_icon' 
 }
 TARGET_VARIABLES = set()
 FEATURE_COLUMNS = set()
@@ -164,7 +169,9 @@ def collect_all_columns():
     column_samples = {}
     for directory in data_directories:
         data_frames = load_data_from_directory(directory) 
+            
         for df in data_frames.values():
+            
             all_columns.update(df.columns)
             for col in df.columns:
                 if col not in column_samples:
@@ -194,6 +201,7 @@ def collect_all_columns():
 
     # Exclude 'UTC_DATE' from numerical features
     NUMERICAL_FEATURES.discard('UTC_DATE')
+    NUMERICAL_FEATURES.discard('UTC_DATE_+0000 UTC')
 
     # Log the identified features
     logging.info(f'Identified TARGET_VARIABLES: {TARGET_VARIABLES}')
@@ -255,8 +263,8 @@ def load_data_from_directory(directory_path, expected_pattern=None):
             if not file.endswith('.csv'):
                 continue
 
-            if parent_dir == 'Hourly Data':
-                pattern = r'^(?P<year>\d{4})\.csv$'
+            if parent_dir == 'Weather':
+                pattern = r'^Toronto\.csv$'
             elif parent_dir == 'Space Data':
                 pattern = r'^space_events_(?P<year>\d{4})\.csv$'
             elif parent_dir == 'Near Earth Space Data':
@@ -272,18 +280,55 @@ def load_data_from_directory(directory_path, expected_pattern=None):
                 continue
 
             category = match.group('category') if 'category' in match.groupdict() else None
-            year = int(match.group('year'))
+            if 'year' in match.groupdict():
+                year = int(match.group('year'))
+            else:
+                logging.warning(f'Year not found in file name: {file}. Attempting to parse file for year information.')
+                try:
+                    df = pd.read_csv(os.path.join(root, file))
+                    if 'dt' in df.columns:
+                        df['dt'] = pd.to_datetime(df['dt'], unit='s', errors='coerce')
+                        df['year'] = df['dt'].dt.year
+                        year = df['year'].iloc[0] if not df['year'].isnull().all() else None
+                        if year is None:
+                            logging.warning(f'Failed to extract year from file: {file}')
+                            continue
+                    elif 'UNIX_TIMESTAMP' in df.columns:
+                        df['UNIX_TIMESTAMP'] = pd.to_datetime(df['UNIX_TIMESTAMP'], unit='s', errors='coerce')
+                        df['year'] = df['UNIX_TIMESTAMP'].dt.year
+                        year = df['year'].iloc[0] if not df['year'].isnull().all() else None
+                        if year is None:
+                            logging.warning(f'Failed to extract year from UNIX_TIMESTAMP in file: {file}')
+                            continue
+                    else:
+                        logging.warning(f'dt or UNIX_TIMESTAMP column not found in file: {file}')
+                        continue
+                except Exception as e:
+                    logging.warning(f'Failed to parse file "{file}" for year information: {e}')
+                    continue
 
             file_path = os.path.join(root, file)
             try:
-                df = pd.read_csv(file_path)
-                data_frames[(category, year)] = df
+                df = pd.read_csv(os.path.join(root, file))
+                df = apply_column_mappings(df)  # Apply column mappings here
+                key = (category, year)
+                if key in data_frames:
+                    data_frames[key] = pd.concat([data_frames[key], df], ignore_index=True)
+                else:
+                    data_frames[key] = df
                 logging.info(f'Loaded file "{file}" with shape {df.shape}.')
+            except Exception as e:
+                logging.error(f'Error processing file "{file}": {e}')
             except Exception as e:
                 logging.warning(f'Failed to read file "{file_path}": {e}')
 
     logging.info(f'Total files loaded from "{directory_path}": {len(data_frames)}')
     return data_frames
+
+def convert_OpenWeatherMap_to_standard(df):
+    # Deprecated due to centralized UTC_DATE handling
+    logging.info("convert_OpenWeatherMap_to_standard is deprecated. Use standardize_utc_date instead.")
+    return standardize_utc_date(df, df_name='convert_OpenWeatherMap_to_standard')
 
 def apply_column_mappings(df):
     """
@@ -296,18 +341,44 @@ def apply_column_mappings(df):
         pd.DataFrame: DataFrame with standardized column names.
     """
     COLUMN_MAPPING = {
-        'UTC_DATE': 'UTC_DATE',
-        'LOCAL_DATE': 'LOCAL_DATE',
-        'UTC_YEAR': 'UTC_YEAR',
-        'UTC_MONTH': 'UTC_MONTH',
-        'UTC_DAY': 'UTC_DAY',
-        'LOCAL_YEAR': 'LOCAL_YEAR',
-        'LOCAL_MONTH': 'LOCAL_MONTH',
-        'LOCAL_DAY': 'LOCAL_DAY',
-        'LOCAL_HOUR': 'LOCAL_HOUR',
-        'date': 'UTC_DATE',
+        'dt': "UNIX_TIMESTAMP", # Ignore
+        'dt_iso': "UTC_DATE",  #TODO: Handle the +0000 UTC   
+        'timezone': "TIMEZONE", # Ignore
+        'city_name': "CITY_NAME", # Ignore
+        'visability': 'visibility', # Good
+        'dew_point': 'dew_point_temp', # Good
+        'feels_like': 'feels_like', # New and good
+        'temp_min': 'temp_min', # New and good
+        'temp_max': 'temp_max', # New and good
+        'pressure': 'pressure_average', # Pressure Average and now good
+        'sea_level': 'sea_level', # New and good 
+        'grnd_level': "grnd_level", # New and good
+        'humidity': "humidity", # New and uncertain
+        'wind_speed': 'wind_speed', # New and uncertain
+        'wind_deg': 'wind_deg', # New and uncertain
+        'wind_gust': 'wind_gust',
+        'rain_1h': 'rain_1h',
+        'rain_3h': 'rain_3h',
+        'snow_1h': 'snow_1h',
+        'snow_3h': 'snow_3h',
+        'clouds_all': 'clouds_all',
+        'weather_id': 'weather_id',
+        'weather_main': 'weather_main',
+        'weather_description': 'weather_description',
+        'weather_icon': 'weather_icon',
+        
+        'UTC_DATE': 'UTC_DATE', # Old file: 
+        'LOCAL_DATE': 'LOCAL_DATE', # Old file: 
+        'UTC_YEAR': 'UTC_YEAR', # Old file: 
+        'UTC_MONTH': 'UTC_MONTH', # Old file: 
+        'UTC_DAY': 'UTC_DAY', # Old file: 
+        'LOCAL_YEAR': 'LOCAL_YEAR', # Old file: 
+        'LOCAL_MONTH': 'LOCAL_MONTH', # Old file: 
+        'LOCAL_DAY': 'LOCAL_DAY', # Old file: 
+        'LOCAL_HOUR': 'LOCAL_HOUR', #Old file: 
+        'date': 'UTC_DATE', 
         'startTime': 'UTC_DATE',
-        'eventTime': 'UTC_DATE',
+        'eventTime': 'UTC_DATE', 
         'beginTime': 'UTC_DATE',
         'peakTime': 'UTC_DATE',
         'endTime': 'UTC_DATE',
@@ -322,39 +393,39 @@ def apply_column_mappings(df):
         'temperature': 'temperature_average',
         'Temperature': 'temperature_average',
         'Temp (°C)': 'temperature_average',
-        'DEW_POINT_TEMP': 'dew_point_temp',
+        # Old file: 'DEW_POINT_TEMP': 'dew_point_temp',
         'dew_point_temp': 'dew_point_temp',
-        'dew_point_temp_flag': 'dew_point_temp_flag',
+        'dew_point_temp_flag': 'dew_point_temp_flag', # [0, 1, 2] - The validity of the data
         'wind_speed_average': 'wind_speed_average',
         'wind_speed_min': 'wind_speed_min',
         'wind_speed_max': 'wind_speed_max',
         'wind_speed': 'wind_speed_average',
         'Wind Speed': 'wind_speed_average',
         'Wind Speed (km/h)': 'wind_speed_average',
-        'WIND_SPEED': 'wind_speed_average',
-        'WINDCHILL': 'windchill',
-        'WINDCHILL_FLAG': 'windchill_flag',
-        'STATION_PRESSURE': 'station_pressure',
+        # Old file: 'WIND_SPEED': 'wind_speed_average',
+        # Old file: 'WINDCHILL': 'windchill',
+        # Old file: 'WINDCHILL_FLAG': 'windchill_flag',
+        # Old file: 'STATION_PRESSURE': 'station_pressure',
         'station_pressure': 'station_pressure',
-        'STATION_PRESSURE_FLAG': 'station_pressure_flag',
+        # Old file: 'STATION_PRESSURE_FLAG': 'station_pressure_flag',
         'pressure_average': 'pressure_average',
         'pressure_min': 'pressure_min',
         'pressure_max': 'pressure_max',
-        'RELATIVE_HUMIDITY': 'relative_humidity',
-        'RELATIVE_HUMIDITY_FLAG': 'relative_humidity_flag',
-        'HUMIDEX': 'humidex',
-        'HUMIDEX_FLAG': 'humidex_flag',
-        'VISIBILITY': 'visibility',
-        'VISIBILITY_FLAG': 'visibility_flag',
-        'PRECIP_AMOUNT': 'precip_amount',
-        'PRECIP_AMOUNT_FLAG': 'precip_amount_flag',
-        'WIND_DIRECTION': 'wind_direction',
-        'WIND_DIRECTION_FLAG': 'wind_direction_flag',
-        'STATION_NAME': 'station_name',
-        'PROVINCE_CODE': 'province_code',
+        # Old file: 'RELATIVE_HUMIDITY': 'relative_humidity',
+        # Old file: 'RELATIVE_HUMIDITY_FLAG': 'relative_humidity_flag',
+        # Old file: 'HUMIDEX': 'humidex',
+        # Old file: 'HUMIDEX_FLAG': 'humidex_flag',
+        # Old file: 'VISIBILITY': 'visibility',
+        # Old file: 'VISIBILITY_FLAG': 'visibility_flag',
+        # Old file: 'PRECIP_AMOUNT': 'precip_amount',
+        # Old file: 'PRECIP_AMOUNT_FLAG': 'precip_amount_flag',
+        # Old file: 'WIND_DIRECTION': 'wind_direction',
+        # Old file: 'WIND_DIRECTION_FLAG': 'wind_direction_flag',
+        # Old file: 'STATION_NAME': 'station_name',
+        # Old file: 'PROVINCE_CODE': 'province_code',
         'sourceLocation': 'source_location',
         'location': 'location',
-        'ID': 'id',
+        # Old file: 'ID': 'id',
         'activityID': 'activity_id',
         'CME_ID': 'cme_id',
         'flrID': 'flr_id',
@@ -521,14 +592,18 @@ def analyze_correlations(df):
     else:
         logging.warning('Cannot perform correlation analysis without target and numerical feature variables.')
 
-def load_and_combine_data():
+def load_and_combine_data(): #TODO: Investigate this function
     logging.info('Starting to load and combine data from all sources.')
 
     # Load Hourly Weather Data
     hourly_data = load_data_from_directory(
-        REAL_TIME_DATA_PATH, expected_pattern='{year}.csv'
+        REAL_TIME_DATA_PATH
     )
+    clear()
+    print(f'Hourly Data: {hourly_data}')
+
     if hourly_data:
+        print('Successfully loaded Hourly Weather Data.')
         logging.info('Loaded Hourly Weather Data.')
         hourly_df = pd.concat(hourly_data.values(), ignore_index=True).copy()
         logging.info(f'Hourly DataFrame shape: {hourly_df.shape}')
@@ -591,14 +666,23 @@ def load_and_combine_data():
         'space_df': space_df,
         'aggregated_near_earth_df': aggregated_near_earth_df
     }
+
     for df_name, df in data_frames_to_process.items():
-        if not df.empty and 'UTC_DATE' in df.columns:
-            df['UTC_DATE'] = pd.to_datetime(df['UTC_DATE'], errors='coerce')
-            df['UTC_DATE'] = df['UTC_DATE'].dt.tz_localize(None)
+        if not df.empty:
+            df = standardize_utc_date(df, df_name=df_name)
             logging.info(f'Processed "UTC_DATE" column in {df_name}.')
             logging.debug(f'{df_name} "UTC_DATE" column type: {df["UTC_DATE"].dtype}')
         else:
             logging.warning(f'"UTC_DATE" column missing or empty in {df_name}.')
+            # Attempt to create 'UTC_DATE' column if missing
+            if 'UTC_DATE' not in df.columns:
+                df['UTC_DATE'] = pd.NaT
+            # Convert to datetime, handling different formats
+            df['UTC_DATE'] = pd.to_datetime(df['UTC_DATE'], errors='coerce')
+            # Drop rows with invalid dates
+            df = df.dropna(subset=['UTC_DATE'])
+            logging.info(f'Attempted to process "UTC_DATE" column in {df_name}.')
+        logging.debug(f'{df_name} "UTC_DATE" column type: {df["UTC_DATE"].dtype}')
 
     # Merge all DataFrames on 'UTC_DATE'
     if not hourly_df.empty and 'UTC_DATE' in hourly_df.columns:
@@ -892,13 +976,225 @@ def validate_numeric_columns(df):
             handle_non_numeric_columns(df)
     return df
 
+def standardize_utc_date(df, df_name=''):
+    """
+    Standardizes the 'UTC_DATE' column in the given DataFrame by handling multiple date formats.
+    
+    Parameters:
+        df (pd.DataFrame): The DataFrame containing the 'UTC_DATE' column.
+        df_name (str): Optional name of the DataFrame for logging purposes.
+    
+    Returns:
+        pd.DataFrame: The DataFrame with the standardized 'UTC_DATE' column.
+    """
+    print('Converting data to standard UTC_DATE format...')
+    # Ensure 'UTC_DATE' column exists
+    if 'UTC_DATE' not in df.columns:
+        logging.warning(f"'UTC_DATE' column missing in DataFrame: {df_name}. Attempting to create it.")
+        df['UTC_DATE'] = pd.NaT  # Create 'UTC_DATE' column with NaT if missing
+    
+    # Convert 'UTC_DATE' to string to handle various formats
+    df['UTC_DATE'] = df['UTC_DATE'].astype(str)
+    
+    # Specific preprocessing for 'hourly_df' to remove timezone info if necessary
+    if df_name == 'hourly_df':
+        # Remove timezone information like " +0000 UTC" or similar patterns
+        df['UTC_DATE'] = df['UTC_DATE'].apply(lambda x: re.sub(r'\s*\+\d{4}\s*UTC$', '', x).strip())
+    
+    # Additional preprocessing steps to handle common date format issues
+    # For example, replacing slashes with hyphens, removing extra spaces, etc.
+    df['UTC_DATE'] = df['UTC_DATE'].str.replace('/', '-', regex=False).str.strip()
+    
+    # Comprehensive list of common datetime formats
+    common_formats = [
+        # ISO 8601 Formats
+        '%Y-%m-%dT%H:%M:%S.%fZ',    # e.g., 2023-08-15T13:45:30.000Z
+        '%Y-%m-%dT%H:%M:%SZ',       # e.g., 2023-08-15T13:45:30Z
+        '%Y-%m-%dT%H:%M:%S.%f%z',   # e.g., 2023-08-15T13:45:30.000+0000
+        '%Y-%m-%dT%H:%M:%S%z',      # e.g., 2023-08-15T13:45:30+0000
+        '%Y-%m-%d %H:%M:%S%z',      # e.g., 2023-08-15 13:45:30+0000
+        '%Y-%m-%d %H:%M:%S.%f%z',   # e.g., 2023-08-15 13:45:30.000+0000
+
+        # Common Formats with Different Separators
+        '%Y-%m-%d %H:%M:%S',        # e.g., 2023-08-15 13:45:30
+        '%d-%m-%Y %H:%M:%S',        # e.g., 15-08-2023 13:45:30
+        '%m-%d-%Y %H:%M:%S',        # e.g., 08-15-2023 13:45:30
+        '%m/%d/%Y %H:%M:%S',        # e.g., 08/15/2023 13:45:30
+        '%d/%m/%Y %H:%M:%S',        # e.g., 15/08/2023 13:45:30
+        '%Y.%m.%d %H:%M:%S',        # e.g., 2023.08.15 13:45:30
+        '%d.%m.%Y %H:%M:%S',        # e.g., 15.08.2023 13:45:30
+        '%Y%m%d %H:%M:%S',           # e.g., 20230815 13:45:30
+        '%d%m%Y %H:%M:%S',           # e.g., 15082023 13:45:30
+        '%Y%m%dT%H%M%S',            # e.g., 20230815T134530
+        '%Y%m%d %H%M%S',            # e.g., 20230815 134530
+
+        # Extended with Milliseconds
+        '%Y-%m-%d %H:%M:%S.%f',     # e.g., 2023-08-15 13:45:30.123456
+        '%d-%m-%Y %H:%M:%S.%f',     # e.g., 15-08-2023 13:45:30.123456
+        '%m/%d/%Y %H:%M:%S.%f',     # e.g., 08/15/2023 13:45:30.123456
+        '%d/%m/%Y %H:%M:%S.%f',     # e.g., 15/08/2023 13:45:30.123456
+        '%Y.%m.%d %H:%M:%S.%f',     # e.g., 2023.08.15 13:45:30.123456
+        '%d.%m.%Y %H:%M:%S.%f',     # e.g., 15.08.2023 13:45:30.123456
+
+        # 12-Hour Formats with AM/PM
+        '%Y-%m-%d %I:%M:%S %p',     # e.g., 2023-08-15 01:45:30 PM
+        '%d-%m-%Y %I:%M:%S %p',     # e.g., 15-08-2023 01:45:30 PM
+        '%m/%d/%Y %I:%M:%S %p',     # e.g., 08/15/2023 01:45:30 PM
+        '%d/%m/%Y %I:%M:%S %p',     # e.g., 15/08/2023 01:45:30 PM
+        '%Y.%m.%d %I:%M:%S %p',     # e.g., 2023.08.15 01:45:30 PM
+        '%d.%m.%Y %I:%M:%S %p',     # e.g., 15.08.2023 01:45:30 PM
+
+        # Unix Timestamp (seconds since epoch)
+        '%s',                        # e.g., 1692107130
+
+        # Other Common Formats
+        '%B %d, %Y %H:%M:%S',        # e.g., August 15, 2023 13:45:30
+        '%b %d, %Y %H:%M:%S',        # e.g., Aug 15, 2023 13:45:30
+        '%d %B %Y %H:%M:%S',         # e.g., 15 August 2023 13:45:30
+        '%d %b %Y %H:%M:%S',         # e.g., 15 Aug 2023 13:45:30
+        '%Y/%m/%d %H:%M:%S',         # e.g., 2023/08/15 13:45:30
+        '%d/%b/%Y %H:%M:%S',         # e.g., 15/Aug/2023 13:45:30
+        '%d-%b-%Y %H:%M:%S',         # e.g., 15-Aug-2023 13:45:30
+        '%d.%b.%Y %H:%M:%S',         # e.g., 15.Aug.2023 13:45:30
+        '%d %b %Y %H:%M:%S',         # e.g., 15 Aug 2023 13:45:30
+        '%Y %b %d %H:%M:%S',         # e.g., 2023 Aug 15 13:45:30
+        '%Y %B %d %H:%M:%S',         # e.g., 2023 August 15 13:45:30
+        '%d %B %Y %H:%M:%S',         # e.g., 15 August 2023 13:45:30
+
+        # Timestamps with Timezone Abbreviations
+        '%Y-%m-%d %H:%M:%S %Z',      # e.g., 2023-08-15 13:45:30 UTC
+        '%d-%m-%Y %H:%M:%S %Z',      # e.g., 15-08-2023 13:45:30 UTC
+        '%m/%d/%Y %H:%M:%S %Z',      # e.g., 08/15/2023 13:45:30 UTC
+        '%d/%m/%Y %H:%M:%S %Z',      # e.g., 15/08/2023 13:45:30 UTC
+        '%Y.%m.%d %H:%M:%S %Z',      # e.g., 2023.08.15 13:45:30 UTC
+        '%d.%m.%Y %H:%M:%S %Z',      # e.g., 15.08.2023 13:45:30 UTC
+
+        # ISO 8601 with milliseconds and timezone
+        '%Y-%m-%dT%H:%M:%S.%f%z',    # e.g., 2023-08-15T13:45:30.000+0000
+        '%Y-%m-%dT%H:%M:%S%z',       # e.g., 2023-08-15T13:45:30+0000
+
+        # Compact Formats
+        '%Y%m%dT%H%M%S%z',           # e.g., 20230815T134530+0000
+        '%Y%m%dT%H%M%S.%f%z',        # e.g., 20230815T134530.000+0000
+
+        # Other Variations
+        '%Y/%m/%dT%H:%M:%S',         # e.g., 2023/08/15T13:45:30
+        '%Y-%m-%dT%H:%M',            # e.g., 2023-08-15T13:45
+        '%Y-%m-%d %H:%M',            # e.g., 2023-08-15 13:45
+        '%d-%m-%Y %H:%M',            # e.g., 15-08-2023 13:45
+        '%m/%d/%Y %H:%M',            # e.g., 08/15/2023 13:45
+        '%d/%m/%Y %H:%M',            # e.g., 15/08/2023 13:45
+        '%Y.%m.%d %H:%M',            # e.g., 2023.08.15 13:45
+        '%d.%m.%Y %H:%M',            # e.g., 15.08.2023 13:45
+
+        # Without Time
+        '%Y-%m-%d',                  # e.g., 2023-08-15
+        '%d-%m-%Y',                  # e.g., 15-08-2023
+        '%m/%d/%Y',                  # e.g., 08/15/2023
+        '%d/%m/%Y',                  # e.g., 15/08/2023
+        '%Y.%m.%d',                  # e.g., 2023.08.15
+        '%d.%m.%Y',                  # e.g., 15.08.2023
+        '%Y%m%d',                    # e.g., 20230815
+        '%d%m%Y',                    # e.g., 15082023
+
+        # With Day Name
+        '%A, %Y-%m-%d %H:%M:%S',    # e.g., Tuesday, 2023-08-15 13:45:30
+        '%a, %Y-%m-%d %H:%M:%S',    # e.g., Tue, 2023-08-15 13:45:30
+        '%A %d %B %Y %H:%M:%S',      # e.g., Tuesday 15 August 2023 13:45:30
+        '%a %d %b %Y %H:%M:%S',      # e.g., Tue 15 Aug 2023 13:45:30
+
+        # With Different Orderings
+        '%m-%d-%Y %H:%M:%S',        # e.g., 08-15-2023 13:45:30
+        '%b %d %Y %H:%M:%S',         # e.g., Aug 15 2023 13:45:30
+        '%B %d %Y %H:%M:%S',         # e.g., August 15 2023 13:45:30
+
+        # Year First with Dots
+        '%Y.%m.%dT%H:%M:%S',         # e.g., 2023.08.15T13:45:30
+        '%Y.%m.%dT%H:%M:%S.%f',      # e.g., 2023.08.15T13:45:30.000
+
+        # Mixed Separators
+        '%Y-%m-%d/%H:%M:%S',         # e.g., 2023-08-15/13:45:30
+        '%d-%m-%Y/%H:%M:%S',         # e.g., 15-08-2023/13:45:30
+
+        # Without Seconds
+        '%Y-%m-%d %H:%M',            # e.g., 2023-08-15 13:45
+        '%d-%m-%Y %H:%M',            # e.g., 15-08-2023 13:45
+        '%m/%d/%Y %H:%M',            # e.g., 08/15/2023 13:45
+        '%d/%m/%Y %H:%M',            # e.g., 15/08/2023 13:45
+        '%Y.%m.%d %H:%M',            # e.g., 2023.08.15 13:45
+        '%d.%m.%Y %H:%M',            # e.g., 15.08.2023 13:45
+        '%Y%m%d %H:%M',              # e.g., 20230815 13:45
+        '%d%m%Y %H:%M',              # e.g., 15082023 13:45
+
+        # ISO 8601 without Time
+        '%Y-%m-%dT%H:%M:%S',         # e.g., 2023-08-15T13:45:30
+        '%Y-%m-%dT%H:%M',            # e.g., 2023-08-15T13:45
+    ]
+    
+    # Function to attempt parsing with multiple formats
+    def parse_date(date_str):
+        # Handle Unix timestamp separately
+        if re.fullmatch(r'\d+', date_str):
+            try:
+                return pd.to_datetime(int(date_str), unit='s', utc=True)
+            except (ValueError, TypeError):
+                pass  # Proceed to other formats
+        
+        # Iterate through the common_formats
+        for fmt in common_formats:
+            try:
+                # Handle timezone-aware formats
+                if '%z' in fmt or '%Z' in fmt:
+                    parsed = pd.to_datetime(date_str, format=fmt, utc=True)
+                else:
+                    parsed = pd.to_datetime(date_str, format=fmt, utc=True)
+                return parsed
+            except (ValueError, TypeError):
+                continue  # Try the next format
+        
+        # Fallback to pandas' generic parser
+        try:
+            parsed = pd.to_datetime(date_str, infer_datetime_format=True, utc=True)
+            return parsed
+        except (ValueError, TypeError):
+            return pd.NaT  # Return Not-a-Time for invalid parsing
+    print(f"Before: {df['UTC_DATE']}")
+    # Apply the parsing function to 'UTC_DATE' column
+    df['UTC_DATE'] = df['UTC_DATE'].apply(parse_date)
+    print(f"After: {df['UTC_DATE']}")
+    # Drop rows with invalid 'UTC_DATE'
+    initial_count = df.shape[0]
+    df = df.dropna(subset=['UTC_DATE'])
+    print(f"Final: {df['UTC_DATE']}")
+    final_count = df.shape[0]
+    dropped_rows = initial_count - final_count
+    if dropped_rows > 0:
+        logging.info(f"Dropped {dropped_rows} rows with invalid 'UTC_DATE' in DataFrame: {df_name}.")
+    
+    # Standardize the datetime format as string in UTC
+    df['UTC_DATE'] = df['UTC_DATE'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Standardized: {df['UTC_DATE']}")
+    
+    logging.info(f"Standardized 'UTC_DATE' in DataFrame: {df_name}.")
+    return df
+
 def handle_non_numeric_columns(df):
     """
-    Handles non-numeric columns by dropping or converting them to numeric through .
+    Handles non-numeric columns by encoding or converting them to numeric.
     Input DataFrame is modified in place.
-    Output: DataFrame with non-numeric columns dropped or converted to numeric.
+    Output: DataFrame with non-numeric columns encoded or converted to numeric.
     """
-    
+    non_numeric_cols = df.select_dtypes(include=['object']).columns
+    for col in non_numeric_cols:
+        try:
+            # Attempt to convert to numeric
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            logging.info(f"Column '{col}' successfully converted to numeric.")
+        except Exception as e:
+            # If conversion fails, apply encoding
+            logging.warning(f"Column '{col}' contains non-numeric data and will be encoded: {e}")
+            df[col] = df[col].astype('category').cat.codes
+            logging.info(f"Column '{col}' successfully encoded as categorical.")
     return df
 
 def parse_json(value):
@@ -973,7 +1269,7 @@ def process_text_features(df):
     return df
 
 
-def preprocess_data(df, is_training=False):
+def preprocess_data(df, is_training=True):
     global preprocessor, num_imputer, cat_imputer, FEATURE_COLUMNS, TARGET_VARIABLES, CATEGORICAL_FEATURES, NUMERICAL_FEATURES
     logging.info('Preprocessing data...')
     
@@ -1044,7 +1340,18 @@ def preprocess_data(df, is_training=False):
     if missing_numerical_features or missing_categorical_features:
         logging.warning(f"Missing numerical features: {missing_numerical_features}")
         logging.warning(f"Missing categorical features: {missing_categorical_features}")
-        return None, None
+
+        # Fill missing numerical features with the mean of the column
+        for feature in missing_numerical_features:
+            X[feature] = 0  # Default value for missing numerical features
+
+        # Fill missing categorical features with a default category
+        for feature in missing_categorical_features:
+            X[feature] = 'missing'  # Default value for missing categorical features
+
+        # Update NUMERICAL_FEATURES and CATEGORICAL_FEATURES to include the filled features
+        NUMERICAL_FEATURES = [col for col in NUMERICAL_FEATURES if col in X.columns]
+        CATEGORICAL_FEATURES = [col for col in CATEGORICAL_FEATURES if col in X.columns]
 
     # Simulate missing values in rows
     for col in X.columns:
@@ -1079,40 +1386,28 @@ def preprocess_data(df, is_training=False):
 
     return (X_processed, y) if is_training else (X_processed, None)
 
-
-
-
 def validate_and_extract_time_features(df):
-    """
-    Validates 'UTC_DATE' and extracts time-based features.
-
-    Parameters:
-        df (pd.DataFrame): The input DataFrame.
-
-    Returns:
-        pd.DataFrame: DataFrame with extracted time-based features or None if validation fails.
-    """
     global FEATURE_COLUMNS, NUMERICAL_FEATURES
-    if 'UTC_DATE' in df.columns:
-        try:
-            df['original_UTC_DATE'] = df['UTC_DATE']
-            df = df.copy()
-            df['UTC_DATE'] = pd.to_datetime(df['UTC_DATE'], errors='coerce')
-            unparseable_dates = df['UTC_DATE'].isna()
-            if unparseable_dates.any():
-                logging.warning(f"Found {unparseable_dates.sum()} unparseable 'UTC_DATE' entries. Examples: {df.loc[unparseable_dates, 'original_UTC_DATE'].head()}")
-                df = df[~unparseable_dates].copy()
-                logging.info(f"Dropped rows with unparseable 'UTC_DATE'.")
-            df['year'] = df['UTC_DATE'].dt.year
-            df['month'] = df['UTC_DATE'].dt.month
-            df['day'] = df['UTC_DATE'].dt.day
-            df['hour'] = df['UTC_DATE'].dt.hour
-            df['day_of_week'] = df['UTC_DATE'].dt.dayofweek
-            FEATURE_COLUMNS.update(['year', 'month', 'day', 'hour', 'day_of_week'])
-            NUMERICAL_FEATURES.update(['year', 'month', 'day', 'hour', 'day_of_week'])
-        except Exception as e:
-            logging.error(f"Error processing 'UTC_DATE': {e}")
-            return None
+    df = standardize_utc_date(df, df_name='validate_and_extract_time_features')
+    
+    # Proceed with extracting time-based features
+    try:
+        df['year'] = pd.to_datetime(df['UTC_DATE']).dt.year
+        df['month'] = pd.to_datetime(df['UTC_DATE']).dt.month
+        df['day'] = pd.to_datetime(df['UTC_DATE']).dt.day
+        df['hour'] = pd.to_datetime(df['UTC_DATE']).dt.hour
+        df['day_of_week'] = pd.to_datetime(df['UTC_DATE']).dt.dayofweek
+    except Exception as e:
+        logging.error(f"Failed to extract time features: {e}")
+        return None
+
+    # Ensure all required columns are present
+    required_columns = ['year', 'month', 'day', 'hour', 'day_of_week']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logging.warning(f"Missing columns after extraction: {missing_columns}")
+        return None
+
     return df
 
 def encode_strings(df):
@@ -1159,36 +1454,11 @@ def parse_json_columns(df):
     Returns:
         pd.DataFrame: DataFrame with parsed JSON columns.
     """
-    json_columns = [col for col in df.columns if df[col].dtype == 'object']
-    for col in json_columns:
-        try:
-            df[col] = df[col].apply(json.loads)
-            logging.info(f'Parsed JSON-like column: {col}')
-        except Exception as e:
-            logging.error(f'Failed to parse column {col}: {e}')
-    return df
-
-def parse_json_columns(df):
-    """
-    Parses JSON-like string columns into actual lists or dictionaries.
-
-    Parameters:
-        df (pd.DataFrame): The input DataFrame.
-
-    Returns:
-        pd.DataFrame: DataFrame with parsed JSON columns.
-    """
     try:
         json_columns = [col for col in df.columns if df[col].dtypes == 'object']
     except Exception as e:
-        print(f'Error: {e}')
-        print('Trying to parse all columns as JSON.')
-        try:
-            json_columns = [col for col in df.columns if df[col].dtypes == 'object']
-        except Exception as e:
-            print(f'Error: {e}')
-            print('Failed to parse colomns as dtype or dtypes.')
-            return df
+        logging.error(f'Error accessing column data types: {e}')
+        return df
     for col in json_columns:
         try:
             df[col] = df[col].apply(json.loads)
@@ -1481,8 +1751,12 @@ def apply_preprocessor(X, y, is_training):
                 X_processed = preprocessor.transform(X)
                 logging.info("Preprocessing completed with transform.")
             else:
-                logging.error("Preprocessor has not been fitted yet.")
-                return None, None
+                try:
+                    X_processed = preprocessor.fit_transform(X)
+                    logging.info("Preprocessor fitted and transformed successfully.")
+                except Exception as e:
+                    logging.error(f"Preprocessor fitting failed: {e}")
+                    return None, None
 
         # Convert to NumPy array if necessary
         if isinstance(X_processed, (pd.DataFrame, pd.Series)):
@@ -1552,7 +1826,34 @@ def apply_preprocessor(X, y, is_training):
 # ============================
 # Performance Analysis
 # ============================
-def plot_roc_auc_scores(roc_auc_scores):
+
+def evaluate_model_accuracy(model, X_train, y_train, target_variables):
+    roc_auc_scores = {}
+    y_pred = model.predict(X_train)
+    pred_col_index = 0  # Index for y_pred columns
+
+    for target in target_variables:
+        if target in y_train.columns:
+            y_score = y_pred[:, pred_col_index]
+            y_true = y_train[target].values
+
+            try:
+                if len(np.unique(y_true)) > 2:
+                    roc_auc = roc_auc_score(y_true, y_score, multi_class='ovr')
+                else:
+                    roc_auc = roc_auc_score(y_true, y_score)
+                roc_auc_scores[target] = roc_auc
+                logging.info(f'ROC AUC for {target}: {roc_auc}')
+            except ValueError as e:
+                logging.error(f"Error calculating ROC AUC for {target}: {e}")
+
+            pred_col_index += 1  # Increment index only when target is present
+        else:
+            logging.warning(f"Target variable {target} not found in y_train columns")
+
+    return {'roc_auc_scores': roc_auc_scores}
+
+def plot_roc_auc_scores(roc_auc_scores, X_train, y_train, model):
     """
     Plots the ROC AUC scores for each target variable.
 
@@ -1575,59 +1876,35 @@ def plot_roc_auc_scores(roc_auc_scores):
     plt.grid(axis='x', linestyle='--', alpha=0.7)
     plt.show()
 
-
-
-def evaluate_model_accuracy(combined_data, X_train, y_train):
-    """
-    Evaluates the accuracy of the trained model using a holdout validation set.
-    """
-    global model, preprocessor
-    logging.info('Evaluating model accuracy...')
-
-    # Split data into training and validation sets
-    train_data = combined_data.sample(frac=0.8, random_state=42)
-    validation_data = combined_data.drop(train_data.index)
-
-    # Preprocess training data
-    if X_train is None or y_train is None:
-        logging.error('Preprocessing failed for training data. Cannot evaluate the model.')
-        print('Preprocessing failed in performance evaluation process for training data. Cannot evaluate the model.')
-        return
-
-    # Preprocess validation data
-    X_val, y_val = X_train, y_train
-    if X_val is None or y_val is None:
-        logging.error('Preprocessing failed for validation data. Cannot evaluate the model.')
-        print('Preprocessing failed in performance evaluation process for validation data. Cannot evaluate the model.')
-        return
-    # Make predictions on the validation data
-    predictions = model.predict(X_val)
-
-    # Calculate ROC AUC for each target variable
-    roc_auc_scores = {}
-    for i, target in enumerate(TARGET_VARIABLES):
-        if target in y_val.columns:
-            # Binarize the target values
-            y_true_binary = (y_val[target] > y_val[target].median()).astype(int)
-            if predictions.ndim > 1 and i < predictions.shape[1]:
-                y_pred_binary = (predictions[:, i] > np.median(predictions[:, i])).astype(int)
-            else:
-                y_pred_binary = (predictions > np.median(predictions)).astype(int)
-            fpr, tpr, _ = roc_curve(y_true_binary, y_pred_binary)
-            roc_auc = auc(fpr, tpr)
-            roc_auc_scores[target] = roc_auc
-            logging.info(f'ROC AUC for {target}: {roc_auc}')
-            print(f'ROC AUC for {target}: {roc_auc}')
-        else:
-            logging.warning(f'Target variable {target} not found in validation data.')
-
-    logging.info('Model evaluation completed.')
-    print('Model evaluation completed.')
-    # Plot the ROC AUC scores
-    plot_roc_auc_scores(roc_auc_scores)
-    return {"roc_auc_scores": roc_auc_scores}
-
+    # Evaluate model accuracy
+    print('Evaluating model accuracy...')
     
+    accuracy = evaluate_model_accuracy(model, X_train, y_train, list(TARGET_VARIABLES))
+    print(f"Model accuracy: {accuracy}")
+    
+
+    def plot_roc_auc_scores(roc_auc_scores):
+        """
+        Plots the ROC AUC scores for each target variable.
+
+        Parameters:
+            roc_auc_scores (dict): Dictionary containing ROC AUC scores for each target variable.
+        """
+        if not roc_auc_scores:
+            logging.warning("No ROC AUC scores to plot.")
+            return
+
+        targets = list(roc_auc_scores.keys())
+        scores = list(roc_auc_scores.values())
+
+        plt.figure(figsize=(10, 6))
+        plt.barh(targets, scores, color='skyblue')
+        plt.xlabel('ROC AUC Score')
+        plt.ylabel('Target Variable')
+        plt.title('ROC AUC Scores for Target Variables')
+        plt.xlim(0, 1)
+        plt.grid(axis='x', linestyle='--', alpha=0.7)
+        plt.show()
 
 
 # ============================
@@ -1692,12 +1969,29 @@ def train_initial_model():
     except Exception as e:
         logging.error(f'Failed to save model or preprocessor: {e}', exc_info=True)
         print(f'Failed to save model or preprocessor: {e}')
-    
+
+    # Save feature metadata
+    feature_metadata = {
+        'FEATURE_COLUMNS': list(FEATURE_COLUMNS),
+        'NUMERICAL_FEATURES': list(NUMERICAL_FEATURES),
+        'CATEGORICAL_FEATURES': list(CATEGORICAL_FEATURES)
+    }
+    feature_metadata_path = os.path.join(KNOWLEDGE_PATH, 'feature_metadata.json')
+    try:
+        with open(feature_metadata_path, 'w') as f:
+            json.dump(feature_metadata, f)
+        logging.info(f'Feature metadata saved successfully at {feature_metadata_path}.')
+        print(f'Feature metadata saved successfully.')
+    except Exception as e:
+        logging.error(f'Failed to save feature metadata: {e}', exc_info=True)
+        print(f'Failed to save feature metadata: {e}')
+
     # Call the function to evaluate model accuracy
     evaluate_model_accuracy(combined_data, X_train, y_train)
 
 def load_and_prepare_data():
-    collect_all_columns()
+    collect_all_columns() # Good
+
     combined_data = load_and_combine_data()
     logging.debug(f'Combined data type: {type(combined_data)}')
     if combined_data.empty:
@@ -1706,9 +2000,8 @@ def load_and_prepare_data():
         return False
     return combined_data
 
-
 def train_model_for_duration(input_seconds):
-    global model, preprocessor
+    global model, preprocessor, target_scaler
 
     try:
         input_seconds = int(input_seconds)
@@ -1735,7 +2028,6 @@ def train_model_for_duration(input_seconds):
             try:
                 preprocessor = joblib.load(preprocessor_path)
                 logging.info('Preprocessor loaded from file.')
-                logging.debug(f'Preprocessor loaded with transformers: {preprocessor.transformers}')
             except Exception as e:
                 logging.error(f'Failed to load preprocessor: {e}', exc_info=True)
                 return False
@@ -1748,7 +2040,23 @@ def train_model_for_duration(input_seconds):
                 ]
             )
             logging.info('Preprocessor initialized successfully.')
-            logging.debug(f'Preprocessor transformers: {preprocessor.transformers}')
+
+    # Initialize or load the target scaler
+    if 'target_scaler' not in globals():
+        target_scaler = None
+
+    if target_scaler is None:
+        target_scaler_path = os.path.join(KNOWLEDGE_PATH, 'target_scaler.joblib')
+        if os.path.exists(target_scaler_path):
+            try:
+                target_scaler = joblib.load(target_scaler_path)
+                logging.info('Target scaler loaded from file.')
+            except Exception as e:
+                logging.error(f'Failed to load target scaler: {e}', exc_info=True)
+                return False
+        else:
+            target_scaler = StandardScaler()
+            logging.info('Target scaler initialized successfully.')
 
     # Preprocess data
     X_train, y_train = preprocess_data(combined_data, is_training=True)
@@ -1758,6 +2066,32 @@ def train_model_for_duration(input_seconds):
         print("Preprocessing failed.")
         logging.error("Preprocessing failed. Cannot train the model.")
         return False
+
+    # Verify column consistency before fitting the preprocessor
+    numeric_features = [col for col in X_train.columns if X_train[col].dtype in [np.float64, np.int64]]
+    categorical_features = [col for col in X_train.columns if X_train[col].dtype == 'object']
+
+    # Update or re-initialize the preprocessor with the correct columns
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', StandardScaler(), numeric_features),
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+        ]
+    )
+
+    # Fit the preprocessor if not already fitted
+    if not hasattr(preprocessor, 'transformers_'):
+        try:
+            preprocessor.fit(X_train)
+        except Exception as e:
+            logging.error(f'Error during preprocessor fitting: {e}', exc_info=True)
+            return False
+            
+        logging.info('Preprocessor fitted successfully.')
+
+    # Scale target variables
+    y_train_scaled = target_scaler.fit_transform(y_train)
+    logging.debug(f'y_train_scaled shape: {y_train_scaled.shape}')
 
     # Initialize the model if not already initialized
     if model is None:
@@ -1777,67 +2111,117 @@ def train_model_for_duration(input_seconds):
         try:
             print(f"Iteration {iteration_count + 1}: Starting fit...")
             logging.info(f"Starting fit for iteration {iteration_count + 1}.")
-            model.partial_fit(X_train, y_train)
+            model.partial_fit(X_train, y_train_scaled)
             iteration_count += 1
             logging.info(f"Iteration {iteration_count} completed. Elapsed time: {elapsed_time:.2f} seconds.")
             print(f"Iteration {iteration_count} completed. Elapsed time: {elapsed_time:.2f} seconds.")
         except Exception as e:
             logging.error(f"Error during training iteration {iteration_count}: {e}", exc_info=True)
+            return False
 
-    # Save the model after training
-    model_path = os.path.join(KNOWLEDGE_PATH, "model.joblib")  # Overwrite model.joblib
+    # Save the model and scalers after training
+    model_path = os.path.join(KNOWLEDGE_PATH, "model.joblib")
+    preprocessor_path = os.path.join(KNOWLEDGE_PATH, 'preprocessor.joblib')
+    target_scaler_path = os.path.join(KNOWLEDGE_PATH, 'target_scaler.joblib')
     try:
         joblib.dump(model, model_path)
-        joblib.dump(preprocessor, os.path.join(KNOWLEDGE_PATH, 'preprocessor.joblib'))  # Save preprocessor as well
-        logging.info(f"Model and preprocessor saved successfully at {model_path}.")
+        joblib.dump(preprocessor, preprocessor_path)
+        joblib.dump(target_scaler, target_scaler_path)
+        logging.info(f"Model and scalers saved successfully at {model_path}.")
     except Exception as e:
-        logging.error(f"Failed to save model or preprocessor: {e}", exc_info=True)
+        logging.error(f"Failed to save model or scalers: {e}", exc_info=True)
         return False
 
     logging.info(f"Training completed. Total iterations: {iteration_count}")
     print(f"Training completed. Total iterations: {iteration_count}")
 
-    # Generate a prediction for the last batch of training data
+    # Generate predictions for the next 365 days every hour
     try:
-        predictions = model.predict(X_train)
-        logging.info('Predictions made successfully for the last batch of training data.')
-        print(f'Predictions: {predictions}')
+        # Generate timestamps for the next 365 days every hour
+        future_data = pd.DataFrame({
+            'datetime': pd.date_range(start=datetime.now(), periods=365*24, freq='h')
+        })
+
+        # Extract time-based features
+        future_data['hour'] = future_data['datetime'].dt.hour
+        future_data['day'] = future_data['datetime'].dt.day
+        future_data['month'] = future_data['datetime'].dt.month
+        future_data['weekday'] = future_data['datetime'].dt.weekday
+
+        # Retain 'datetime' column and exclude it from features
+        features_future = future_data.drop(columns=['datetime'])
+
+        # Ensure all columns in the preprocessor are present in the features
+        required_columns = set(preprocessor.transformers_[0][2]) | set(preprocessor.transformers_[1][2])
+        missing_cols = required_columns - set(features_future.columns)
+        for col in missing_cols:
+            features_future[col] = 0  # Fill missing columns with default values
+
+        # Convert all column names to strings
+        features_future.columns = features_future.columns.astype(str)
+
+        # Ensure features_future has the same number of features as expected by the preprocessor
+        features_future = features_future.reindex(columns=list(required_columns), fill_value=0)
+
+        # Always transform without fitting
+        X_future = preprocessor.transform(features_future)
+
+        # Ensure the model is fitted before making predictions
+        if not hasattr(model, 'estimators_'):
+            model.partial_fit(X_train, y_train_scaled)
+        else:
+            model.fit(X_train, y_train_scaled)
+
+        # Make predictions
+        predictions_scaled = model.predict(X_future)
+
+        # Check for NaN or infinite values in predictions_scaled
+        if np.isnan(predictions_scaled).any() or np.isinf(predictions_scaled).any():
+            logging.error("Predictions contain NaN or infinite values. Cannot apply inverse transform.")
+            return False
+
+        # Inverse transform to get original scale
+        try:
+            predictions = target_scaler.inverse_transform(predictions_scaled)
+        except Exception as e:
+            logging.error(f"Failed to apply inverse transform: {e}")
+            return False
+
+        # Ensure the number of columns in predictions matches the number of target variables
+        if predictions.shape[1] != len(TARGET_VARIABLES):
+            logging.error(f"Shape of predictions {predictions.shape} does not match number of target variables {len(TARGET_VARIABLES)}.")
+            # Adjust the shape of predictions to match TARGET_VARIABLES
+            adjusted_predictions = np.zeros((predictions.shape[0], len(TARGET_VARIABLES)))
+            adjusted_predictions[:, :predictions.shape[1]] = predictions
+            predictions = adjusted_predictions
+
+        # Convert predictions to DataFrame
+        predictions_df = pd.DataFrame(predictions, columns=list(TARGET_VARIABLES))
+        
+        # Combine with datetime
+        predictions_df['datetime'] = future_data['datetime'].reset_index(drop=True)
+
+        # Replace null values with zero
+        predictions_df.fillna(0, inplace=True)
+
+        # Convert DataFrame to JSON format
+        predictions_df.set_index('datetime', inplace=True)
+        predictions_json = predictions_df.to_json(orient='index', date_format='iso')
+
+        # Save to a JSON file
+        predictions_path = os.path.join(KNOWLEDGE_PATH, 'Predictions', str(datetime.now().date()))
+        os.makedirs(predictions_path, exist_ok=True)
+        predictions_json_path = os.path.join(predictions_path, 'future_predictions.json')
+
+        with open(predictions_json_path, 'w') as json_file:
+            json_file.write(predictions_json)
+
+        logging.info(f"Future predictions saved to {predictions_json_path}.")
+        print(f"Future predictions saved to {predictions_json_path}.")
+
     except Exception as e:
-        logging.error(f'Failed to make predictions: {e}', exc_info=True)
+        logging.error(f"Failed to generate future predictions: {e}", exc_info=True)
         return False
-
-
-    # Evaluate model accuracy
-    print('Evaluating model accuracy...')
-    accuracy = evaluate_model_accuracy(combined_data, X_train, y_train)
-    print(f"Model accuracy: {accuracy}")
-    import matplotlib.pyplot as plt
-
-    def plot_roc_auc_scores(roc_auc_scores):
-        """
-        Plots the ROC AUC scores for each target variable.
-
-        Parameters:
-            roc_auc_scores (dict): Dictionary containing ROC AUC scores for each target variable.
-        """
-        if not roc_auc_scores:
-            logging.warning("No ROC AUC scores to plot.")
-            return
-
-        targets = list(roc_auc_scores.keys())
-        scores = list(roc_auc_scores.values())
-
-        plt.figure(figsize=(10, 6))
-        plt.barh(targets, scores, color='skyblue')
-        plt.xlabel('ROC AUC Score')
-        plt.ylabel('Target Variable')
-        plt.title('ROC AUC Scores for Target Variables')
-        plt.xlim(0, 1)
-        plt.grid(axis='x', linestyle='--', alpha=0.7)
-        plt.show()
-
-    # Plot the ROC AUC scores
-    plot_roc_auc_scores(accuracy['roc_auc_scores'])
 
     return True
 
@@ -1913,7 +2297,13 @@ def process_new_data(file_path):
     predictions_df = pd.DataFrame(predictions, columns=list(TARGET_VARIABLES))
     predictions_df['timestamp'] = datetime.now()
     predictions_df['source_file'] = os.path.basename(file_path)
-    predictions_path = os.path.join(KNOWLEDGE_PATH, 'predictions.csv')
+    
+    # Create a new directory with the current date
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    predictions_dir = os.path.join(KNOWLEDGE_PATH, date_str)
+    os.makedirs(predictions_dir, exist_ok=True)
+    
+    predictions_path = os.path.join(predictions_dir, 'predictions.csv')
     try:
         # Append to CSV, write header only if file does not exist
         predictions_df.to_csv(predictions_path, mode='a', header=not os.path.exists(predictions_path), index=False)
@@ -1928,7 +2318,7 @@ def process_new_data(file_path):
         try:
             model.partial_fit(X_new, y_new)
             # Save the updated model
-            model_path = os.path.join(KNOWLEDGE_PATH, 'model.joblib')
+            model_path = os.path.join(predictions_dir, 'model.joblib')
             joblib.dump(model, model_path)
             logging.info(f'Model updated and saved at {model_path}.')
         except AttributeError:
@@ -2111,7 +2501,8 @@ def display_menu():
     -------------------------
     1. Train AI Model
     2. Generate Forecasts
-    3. Exit
+    3. Decode Last Predictions
+    4. Exit
     -------------------------
     """
     return input(menu)
@@ -2124,7 +2515,7 @@ def get_user_choice():
         
     # Return 1, 2, 3, or none
     choice = display_menu()
-    if choice in ['1', '2', '3']:
+    if choice in ['1', '2', '3', '4']:
         return int(choice)
     else:
         return
@@ -2153,6 +2544,38 @@ def train():
     else:
         print("Invalid input. Please enter a valid number.")
 
+def get_last_prediction():
+    predictions_path = os.path.join(KNOWLEDGE_PATH, 'Predictions')
+    if not os.path.exists(predictions_path):
+        print("No predictions directory found.")
+        return
+
+    predictions_files = [f for f in os.listdir(predictions_path) if f.endswith('.csv')]
+    if not predictions_files:
+        print("No predictions files found.")
+        return
+
+    latest_file = max(predictions_files, key=lambda f: os.path.getmtime(os.path.join(predictions_path, f)))
+    predictions_csv_path = os.path.join(predictions_path, latest_file)
+
+    # Load the predictions from the CSV file
+    predictions_df = pd.read_csv(predictions_csv_path)
+
+    # Now you can view the decoded predictions
+    print(predictions_df.head())
+    if not predictions_files:
+        print("No predictions files found.")
+        return
+
+    latest_file = max(predictions_files, key=lambda f: os.path.getmtime(os.path.join(predictions_path, f)))
+    predictions_csv_path = os.path.join(predictions_path, latest_file)
+
+    # Load the predictions from the CSV file
+    predictions_df = pd.read_csv(predictions_csv_path)
+
+    # Now you can view the decoded predictions
+    print(predictions_df.head())
+
 def forecast():
     """
     Function to handle the generation of forecasts.
@@ -2163,27 +2586,27 @@ def forecast():
             print(f"\nPredictions for {period} forecast period:")
             print(df.head())  # Display top rows of predictions
     else:
-        print("No predictions generated.")
+        print("Please train the model.")
     input("Press Enter to continue...")
 
 def action(command):
     """
     Executes the action based on user choice.
     """
-    if command == 3:
+    if command == 4:
         print("Exiting...")
         sys.exit(0)
 
     update()
 
-    {1: train, 2: forecast}.get(command, lambda: print(f"Invalid choice {command}. Please select a valid option."))()
+    {1: train, 2: forecast, 3: get_last_prediction}.get(command, lambda: print(f"Invalid choice {command}. Please select a valid option."))()
 
 def update():
     """
     Checks the last update time from a file and updates the data if more than an hour has passed since the last update.
 
     The function performs the following steps:
-    1. Reads the last update time from 'last_update.txt' located in the KNOWLEDGE_PATH directory.
+    1. Reads the last update time from last_update.txt located in the KNOWLEDGE_PATH directory.
     2. If the file does not exist or an error occurs while reading, it assumes the data needs to be updated.
     3. Compares the last update time with the current time.
     4. If more than an hour has passed since the last update, it calls the `update_data` function to update the data.
@@ -2218,28 +2641,32 @@ def update():
 
 def initialize_model():
     """
-    Initializes the model by loading the model and preprocessor from the files if they exist.
+    Initializes the model by loading the model, preprocessor, and feature metadata from the files if they exist.
     """
     global model, preprocessor, FEATURE_COLUMNS, NUMERICAL_FEATURES, CATEGORICAL_FEATURES, KNOWLEDGE_PATH
 
-    if model is not None and preprocessor is not None:
-        return model, preprocessor # Return the existing model and preprocessor
+    if model is not None and preprocessor is not None and FEATURE_COLUMNS:
+        return model, preprocessor  # Return the existing model and preprocessor
+
     model_path = os.path.join(KNOWLEDGE_PATH, 'model.joblib')
     preprocessor_path = os.path.join(KNOWLEDGE_PATH, 'preprocessor.joblib')
-    if os.path.exists(model_path) and os.path.exists(preprocessor_path):
+    feature_metadata_path = os.path.join(KNOWLEDGE_PATH, 'feature_metadata.json')
+
+    if os.path.exists(model_path) and os.path.exists(preprocessor_path) and os.path.exists(feature_metadata_path):
         try:
             model = joblib.load(model_path)
             preprocessor = joblib.load(preprocessor_path)
-            model_data = joblib.load(model_path)
-            FEATURE_COLUMNS = model_data['FEATURE_COLUMNS']
-            NUMERICAL_FEATURES = model_data['NUMERICAL_FEATURES']
-            CATEGORICAL_FEATURES = model_data['CATEGORICAL_FEATURES']
-            logging.info('Model and preprocessor loaded from file.')
+            with open(feature_metadata_path, 'r') as f:
+                metadata = json.load(f)
+                FEATURE_COLUMNS = set(metadata['FEATURE_COLUMNS'])
+                NUMERICAL_FEATURES = set(metadata['NUMERICAL_FEATURES'])
+                CATEGORICAL_FEATURES = set(metadata['CATEGORICAL_FEATURES'])
+            logging.info('Model, preprocessor, and feature metadata loaded successfully.')
         except Exception as e:
-            logging.error(f'Failed to load model or preprocessor: {e}', exc_info=True)
-            print(f'Failed to load model or preprocessor: {e}')
+            logging.error(f'Failed to load model, preprocessor, or feature metadata: {e}', exc_info=True)
+            print(f'Failed to load model, preprocessor, or feature metadata: {e}')
     else:
-        logging.warning('Model and preprocessor files not found. Training a new model.')
+        logging.warning('Model, preprocessor, or feature metadata files not found. Initiating training.')
         # Decide whether to attempt to train a new model or exit
         choice = input("Would you like to train a new model? (y/n): ").strip().lower()
         if choice == 'y':
@@ -2255,6 +2682,7 @@ def main():
     """
     while True:
         clear_console()
+        update()
         action(get_user_choice())
         input('Press Enter to continue...')
 
